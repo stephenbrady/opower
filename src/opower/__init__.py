@@ -1,6 +1,23 @@
 """Library for getting historical and forecasted usage/cost from an utility using opower.com JSON API."""
 
-from .exceptions import CannotConnect, InvalidAuth, MfaChallenge
+from .exceptions import (
+    ApiException,
+    AuthenticationError,
+    CannotConnect,
+    FailureCategory,
+    FailureDetails,
+    FailureStage,
+    InvalidAuth,
+    InvalidCredentials,
+    MfaChallenge,
+    MfaCodeRejected,
+    OpowerError,
+    PasswordExpired,
+    ProtocolError,
+    RateLimited,
+    RetryDisposition,
+    TemporaryAuthenticationError,
+)
 from .helpers import create_cookie_jar
 from .opower import (
     Account,
@@ -21,15 +38,28 @@ from .utilities.base import MfaHandlerBase
 __all__ = [
     "Account",
     "AggregateType",
+    "ApiException",
+    "AuthenticationError",
     "CannotConnect",
     "CostRead",
+    "FailureCategory",
+    "FailureDetails",
+    "FailureStage",
     "Forecast",
     "InvalidAuth",
+    "InvalidCredentials",
     "MeterType",
     "MfaChallenge",
+    "MfaCodeRejected",
     "MfaHandlerBase",
     "Opower",
+    "OpowerError",
+    "PasswordExpired",
+    "ProtocolError",
+    "RateLimited",
     "ReadResolution",
+    "RetryDisposition",
+    "TemporaryAuthenticationError",
     "UnitOfMeasure",
     "UsageRead",
     "create_cookie_jar",
