@@ -15,7 +15,8 @@ import arrow
 from aiohttp.client_exceptions import ClientError, ClientResponseError
 
 from .const import USER_AGENT
-from .exceptions import ApiException, CannotConnect, InvalidAuth
+from .exceptions import ApiException, CannotConnect, FailureStage, TemporaryAuthenticationError
+from .http_response import ResponseSummary, classify_http_failure, new_correlation_id, summarize_response
 from .utilities import UtilityBase
 
 _LOGGER = logging.getLogger(__file__)
@@ -245,6 +246,7 @@ class Opower:
         self.customers: list[Any] = []
         self.user_accounts: list[Any] = []
         self.meters: list[str] = []
+        self._operation_id: str | None = None
 
     async def async_login(self) -> None:
         """Login to the utility website and authorize opower.com for access.
@@ -253,12 +255,16 @@ class Opower:
         :raises MfaChallenge: if interactive MFA is required
         :raises CannotConnect: if we receive any HTTP error
         """
+        self._operation_id = new_correlation_id()
         try:
             self.access_token = await self.utility.async_login(self.session, self.username, self.password, self.login_data)
         except ClientResponseError as err:
-            if err.status in (401, 403):
-                raise InvalidAuth(err) from err
-            raise CannotConnect(err) from err
+            details = classify_http_failure(
+                ResponseSummary(err.status or 0, None, None, None, None),
+                FailureStage.LOGIN,
+                operation_id=self._operation_id,
+            )
+            raise TemporaryAuthenticationError("Utility login request failed", details=details) from err
         except ClientError as err:
             raise CannotConnect(err) from err
 
@@ -796,20 +802,30 @@ class Opower:
             return "webcenter"
         return "ei"
 
-    async def _async_get_request(self, url: str, params: dict[str, str], headers: dict[str, str]) -> Any:
+    async def _async_get_request(
+        self,
+        url: str,
+        params: dict[str, str],
+        headers: dict[str, str],
+        stage: FailureStage = FailureStage.UNKNOWN,
+    ) -> Any:
         full_url = f"{url}?{urlencode(params)}"
         _LOGGER.debug("Fetching: %s", full_url)
         try:
             async with self.session.get(url, params=params, headers=headers) as resp:
                 if not resp.ok:
+                    summary = summarize_response(resp)
                     raise ApiException(
                         f"HTTP Error: {resp.status}",
                         url=full_url,
                         status=resp.status,
-                        response_text=await resp.text(),
+                        response_text=_safe_response_text(summary),
+                        details=classify_http_failure(summary, stage, operation_id=self._operation_id),
                     )
                 result = await resp.json()
-                _LOGGER.log(logging.DEBUG - 1, "Fetched: %s", json.dumps(result, indent=2))
+                _LOGGER.log(
+                    logging.DEBUG - 1, "Fetched response metadata: %s", summarize_response(resp, result).as_diagnostics()
+                )
                 return result
         except ClientError as e:
             raise ApiException(f"Client Error: {e}", url=full_url) from e
@@ -825,14 +841,20 @@ class Opower:
                 json={"query": query},
             ) as resp:
                 if not resp.ok:
+                    summary = summarize_response(resp)
                     raise ApiException(
                         f"HTTP Error: {resp.status}",
                         url=url,
                         status=resp.status,
-                        response_text=await resp.text(),
+                        response_text=_safe_response_text(summary),
+                        details=classify_http_failure(summary, FailureStage.GRAPHQL, operation_id=self._operation_id),
                     )
                 result = await resp.json()
-                _LOGGER.log(logging.DEBUG - 1, "GraphQL response: %s", json.dumps(result, indent=2))
+                _LOGGER.log(
+                    logging.DEBUG - 1,
+                    "GraphQL response metadata: %s",
+                    summarize_response(resp, result).as_diagnostics(),
+                )
                 if "errors" in result:
                     raise ApiException(
                         f"GraphQL Error: {result['errors']}",
@@ -841,3 +863,8 @@ class Opower:
                 return result
         except ClientError as e:
             raise ApiException(f"Client Error: {e}", url=url) from e
+
+
+def _safe_response_text(summary: ResponseSummary) -> str:
+    """Render response metadata without exposing provider response content."""
+    return f"content_type={summary.content_type or 'unknown'}; schema={summary.schema or ()}"
