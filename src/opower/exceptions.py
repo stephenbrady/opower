@@ -13,7 +13,7 @@ class FailureCategory(StrEnum):
     """Broad machine-readable category for an Opower failure."""
 
     INVALID_CREDENTIALS = "invalid_credentials"
-    PASSWORD_EXPIRED = "password_expired"
+    PASSWORD_EXPIRED = "password_expired"  # noqa: S105
     MFA_REQUIRED = "mfa_required"
     MFA_CODE_REJECTED = "mfa_code_rejected"
     MFA_REPLAY_PREVENTED = "mfa_replay_prevented"
@@ -22,7 +22,7 @@ class FailureCategory(StrEnum):
     PROVIDER_UNAVAILABLE = "provider_unavailable"
     TRANSPORT = "transport"
     PROTOCOL = "protocol"
-    TOKEN_EXCHANGE = "token_exchange"
+    TOKEN_EXCHANGE = "token_exchange"  # noqa: S105
     AUTHORIZATION = "authorization"
     API = "api"
     UNKNOWN = "unknown"
@@ -35,7 +35,7 @@ class FailureStage(StrEnum):
     MFA_GENERATION = "mfa_generation"
     MFA_VERIFICATION = "mfa_verification"
     AUTH_REDIRECT = "auth_redirect"
-    TOKEN_EXCHANGE = "token_exchange"
+    TOKEN_EXCHANGE = "token_exchange"  # noqa: S105
     CUSTOMERS = "customers"
     ACCOUNTS = "accounts"
     FORECAST = "forecast"

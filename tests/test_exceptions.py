@@ -1,7 +1,9 @@
 """Tests for structured Opower exceptions."""
 
 import datetime
+import typing
 
+import opower.utilities.base
 from opower import (
     ApiException,
     AuthenticationError,
@@ -24,7 +26,6 @@ from opower import (
 
 class _MfaHandler:
     """Minimal MFA handler used to verify compatibility."""
-
 
 
 def test_failure_details_as_dict() -> None:
@@ -104,7 +105,7 @@ def test_mfa_challenge_constructor_remains_compatible() -> None:
     error = MfaChallenge("MFA required", handler)  # type: ignore[arg-type]
 
     assert str(error) == "MFA required"
-    assert error.handler is handler
+    assert error.handler is typing.cast("opower.utilities.base.MfaHandlerBase", handler)
     assert error.details is None
 
 
@@ -128,9 +129,7 @@ def test_api_exception_constructor_and_rendering_remain_compatible() -> None:
     assert error.url == "https://example.invalid/endpoint"
     assert error.status == 500
     assert error.response_text == "temporary provider failure"
-    assert str(error) == (
-        "HTTP Error: 500\n"
-        "URL: https://example.invalid/endpoint\n"
-        "Status: 500\n"
-        "Response: temporary provider failure"
+    assert (
+        str(error)
+        == "HTTP Error: 500\nURL: https://example.invalid/endpoint\nStatus: 500\nResponse: temporary provider failure"
     )
