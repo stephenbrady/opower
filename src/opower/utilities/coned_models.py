@@ -8,7 +8,6 @@ from ..exceptions import (
     FailureCategory,
     FailureDetails,
     FailureStage,
-    InvalidAuth,
     InvalidCredentials,
     MfaCodeRejected,
     PasswordExpired,
@@ -149,7 +148,10 @@ def _optional_string(data: Mapping[str, Any], key: str, stage: str) -> str | Non
     if value is None:
         return None
     if not isinstance(value, str) or not value:
-        raise ProtocolError(f"ConEd {stage} response field {key!r} was not a non-empty string", details=_protocol_details(stage))
+        raise ProtocolError(
+            f"ConEd {stage} response field {key!r} was not a non-empty string",
+            details=_protocol_details(stage),
+        )
     return value
 
 
