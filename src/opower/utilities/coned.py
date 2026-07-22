@@ -3,11 +3,17 @@
 from typing import Any
 
 import aiohttp
-from pyotp import TOTP
+import pyotp
 
 from ..const import USER_AGENT
-from ..exceptions import InvalidAuth
+from ..exceptions import FailureCategory, FailureDetails, FailureStage, InvalidAuth, ProtocolError, RetryDisposition
 from .base import UtilityBase
+from .coned_models import (
+    parse_factor_response,
+    parse_login_response,
+    raise_for_factor_rejection,
+    raise_for_login_rejection,
+)
 
 RETURN_URL = "/en/accounts-billing/my-account/energy-use"
 
@@ -75,40 +81,50 @@ class ConEd(UtilityBase):
             headers=login_headers,
             raise_for_status=True,
         ) as resp:
-            result = await resp.json()
-            if not result["login"]:
-                raise InvalidAuth("Username/Password are invalid")
+            login_response = parse_login_response(await resp.json())
+            raise_for_login_rejection(login_response)
 
-            redirectUrl = None
-            if "authRedirectUrl" in result:
-                redirectUrl = result["authRedirectUrl"]
-            elif result["newDevice"]:
-                if not result["noMfa"]:
-                    if not self._totp_secret:
-                        raise InvalidAuth("TOTP secret is required for MFA accounts")
+            redirect_url = login_response.auth_redirect_url
+            if redirect_url is None and login_response.new_device and not login_response.no_mfa:
+                if not self._totp_secret:
+                    raise InvalidAuth(
+                        "A TOTP secret is required for this ConEd account",
+                        details=FailureDetails(
+                            category=FailureCategory.MFA_REQUIRED,
+                            stage=FailureStage.MFA_GENERATION,
+                            retry=RetryDisposition.USER_ACTION_REQUIRED,
+                            message_key="coned_totp_secret_required",
+                        ),
+                    )
 
-                    mfaCode = TOTP(self._totp_secret).now()
+                mfa_code = pyotp.TOTP(self._totp_secret).now()
 
-                    async with session.post(
-                        login_base + "/VerifyFactor",
-                        headers=login_headers,
-                        json={
-                            "MFACode": mfaCode,
-                            "ReturnUrl": RETURN_URL,
-                            "OpenIdRelayState": "",
-                        },
-                        raise_for_status=True,
-                    ) as resp:  # noqa: PLW2901
-                        mfaResult = await resp.json()
-                        if not mfaResult["code"]:
-                            raise InvalidAuth("2FA code was invalid. Is the secret wrong?")
-                        redirectUrl = mfaResult["authRedirectUrl"]
-            else:
-                raise InvalidAuth("Login Failed")
+                async with session.post(
+                    login_base + "/VerifyFactor",
+                    headers=login_headers,
+                    json={
+                        "MFACode": mfa_code,
+                        "ReturnUrl": RETURN_URL,
+                        "OpenIdRelayState": "",
+                    },
+                    raise_for_status=True,
+                ) as resp:  # noqa: PLW2901
+                    factor_response = parse_factor_response(await resp.json())
+                    raise_for_factor_rejection(factor_response)
+                    redirect_url = factor_response.auth_redirect_url
 
-            assert redirectUrl
+            if redirect_url is None:
+                raise ProtocolError(
+                    "ConEd login succeeded without an authorization redirect",
+                    details=FailureDetails(
+                        category=FailureCategory.PROTOCOL,
+                        stage=FailureStage.AUTH_REDIRECT,
+                        retry=RetryDisposition.DO_NOT_RETRY,
+                        message_key="coned_auth_redirect_missing",
+                    ),
+                )
             async with session.get(
-                redirectUrl,
+                redirect_url,
                 headers={
                     "User-Agent": USER_AGENT,
                 },
