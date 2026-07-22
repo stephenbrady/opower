@@ -2,7 +2,7 @@
 
 from datetime import datetime
 from typing import TYPE_CHECKING
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock, patch
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -25,7 +25,9 @@ if TYPE_CHECKING:
 
 @pytest.mark.parametrize("utility", get_supported_utilities())
 @pytest.mark.asyncio
-async def test_rejected_login_raises_authentication_error(utility: type["UtilityBase"]) -> None:
+async def test_rejected_login_raises_authentication_error(
+    utility: type["UtilityBase"],
+) -> None:
     """A rejected login raises an authentication error without over-classifying it."""
     async with aiohttp.ClientSession(cookie_jar=create_cookie_jar()) as session:
         opower = Opower(
@@ -35,7 +37,14 @@ async def test_rejected_login_raises_authentication_error(utility: type["Utility
             password="test",  # noqa: S106
             optional_totp_secret=None,
         )
-        with pytest.raises(AuthenticationError):
+        with (
+            patch.object(
+                opower.utility,
+                "async_login",
+                new=AsyncMock(side_effect=AuthenticationError("Rejected login")),
+            ),
+            pytest.raises(AuthenticationError),
+        ):
             await opower.async_login()
 
 
