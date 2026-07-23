@@ -1,9 +1,13 @@
 """Base class that each utility needs to extend."""
 
 import abc
-from typing import Any, ClassVar
+import datetime
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import aiohttp
+
+if TYPE_CHECKING:
+    from ..authentication import AuthenticationAttemptContext
 
 
 class UtilityBase(abc.ABC):
@@ -19,6 +23,7 @@ class UtilityBase(abc.ABC):
     def __init__(self) -> None:
         """Initialize."""
         self._totp_secret: str | None = None
+        self._authentication_context: AuthenticationAttemptContext | None = None
 
     @staticmethod
     @abc.abstractmethod
@@ -72,6 +77,22 @@ class UtilityBase(abc.ABC):
     def set_totp_secret(self, totp_secret: str) -> None:
         """Set the TOTP secret."""
         self._totp_secret = totp_secret
+
+    @staticmethod
+    def authentication_timeout() -> datetime.timedelta:
+        """Return the complete authentication transaction timeout."""
+        return datetime.timedelta(seconds=120)
+
+    def set_authentication_context(
+        self,
+        context: "AuthenticationAttemptContext | None",
+    ) -> None:
+        """Attach progress coordination for the active authentication attempt."""
+        self._authentication_context = context
+
+    def clear_authentication_state(self) -> None:
+        """Clear utility-specific state derived from the current session."""
+        return
 
     @abc.abstractmethod
     async def async_login(

@@ -46,6 +46,15 @@ This library is used by the [Opower integration in Home Assistant](https://www.h
 - Southern Maryland Electric Cooperative (SMECO)
 - Southwest Gas
 
+## Authentication coordination
+
+Each `Opower` instance owns one authentication manager and at most one
+in-flight login task. Concurrent operations sharing that instance join the
+same bounded authentication attempt and reuse its result. Separate `Opower`
+instances do not coordinate; callers should reuse one runtime instance per
+configured account while using a separate temporary instance to validate
+candidate credentials.
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a pull request.

@@ -3,9 +3,10 @@
 import dataclasses
 import json
 import logging
+from collections.abc import Awaitable, Callable
 from datetime import date, datetime, timedelta
 from enum import Enum
-from typing import Any
+from typing import Any, TypeVar
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
@@ -14,6 +15,12 @@ import aiozoneinfo
 import arrow
 from aiohttp.client_exceptions import ClientError, ClientResponseError
 
+from .authentication import (
+    AuthenticationAttemptContext,
+    AuthenticationGate,
+    AuthenticationProgress,
+    AuthenticationResetReason,
+)
 from .const import USER_AGENT
 from .exceptions import (
     ApiException,
@@ -36,6 +43,7 @@ from .http_response import (
 from .utilities import UtilityBase
 
 _LOGGER = logging.getLogger(__file__)
+_ResponseT = TypeVar("_ResponseT")
 
 
 def _parse_read_time(value: str, tz: ZoneInfo) -> datetime:
@@ -262,15 +270,41 @@ class Opower:
         self.customers: list[Any] = []
         self.user_accounts: list[Any] = []
         self.meters: list[str] = []
+        self._authentication_gate = AuthenticationGate(
+            timeout=self.utility.authentication_timeout(),
+            invalidate_session=self._clear_authentication_state,
+        )
 
     async def async_login(self) -> None:
-        """Login to the utility website and authorize opower.com for access.
+        """Ensure this instance has a usable authenticated utility session."""
+        await self.async_ensure_authenticated()
 
-        :raises InvalidAuth: if login information is incorrect
-        :raises MfaChallenge: if interactive MFA is required
-        :raises CannotConnect: if we receive any HTTP error
-        """
-        attempt_id = new_correlation_id()
+    async def async_ensure_authenticated(self) -> AuthenticationProgress:
+        """Join or start the shared authentication attempt for this instance."""
+        return await self._authentication_gate.async_ensure_authenticated(self._async_login)
+
+    async def async_reset_authentication(
+        self,
+        reason: AuthenticationResetReason = AuthenticationResetReason.MANUAL,
+    ) -> AuthenticationProgress:
+        """Cancel a stalled attempt and invalidate its session coherently."""
+        return await self._authentication_gate.async_reset(reason)
+
+    async def async_authentication_progress(self) -> AuthenticationProgress:
+        """Return user-safe progress for setup and reauthentication UIs."""
+        return await self._authentication_gate.async_progress()
+
+    def _clear_authentication_state(self) -> None:
+        """Clear state derived from the current utility authentication."""
+        self.access_token = None
+        self.utility.clear_authentication_state()
+
+    async def _async_login(
+        self,
+        context: AuthenticationAttemptContext,
+    ) -> None:
+        """Login to the utility and authorize Opower API access."""
+        self.utility.set_authentication_context(context)
         try:
             self.access_token = await self.utility.async_login(self.session, self.username, self.password, self.login_data)
         except ClientResponseError as err:
@@ -281,11 +315,13 @@ class Opower:
                     stage=FailureStage.LOGIN,
                     authentication=AuthenticationExpectation.NO_AUTOMATIC_REAUTHENTICATION,
                 ),
-                attempt_id=attempt_id,
+                attempt_id=context.attempt_id,
             )
             raise TemporaryAuthenticationError("Utility login request failed", details=details) from err
         except ClientError as err:
             raise CannotConnect(err) from err
+        finally:
+            self.utility.set_authentication_context(None)
 
     async def async_get_accounts(self) -> list[Account]:
         """Get a list of accounts for the signed in user.
@@ -356,10 +392,9 @@ class Opower:
 
         for customer in await self._async_get_customers():
             customer_uuid = customer["uuid"]
-            headers = self._get_headers(customer_uuid)
 
             try:
-                result = await self._async_post_graphql(query, headers)
+                result = await self._async_post_graphql(query, customer_uuid)
             except ApiException as err:
                 _LOGGER.debug("Ignoring GraphQL bill forecast error: %s", err)
                 continue
@@ -434,13 +469,21 @@ class Opower:
             if self.utility.is_dss() and not self.user_accounts:
                 await self._async_get_user_accounts()
 
-            url = (
-                f"https://{self._get_subdomain()}.opower.com/{self._get_api_root()}"
-                f"/edge/apis/multi-account-v1/cws/{self.utility.utilitycode()}"
-                "/customers?offset=0&batchSize=100&addressFilter="
-            )
             try:
-                result = await self._async_get_request(url, {}, self._get_headers())
+                result = await self._async_get_request(
+                    lambda: (
+                        f"https://{self._get_subdomain()}.opower.com/{self._get_api_root()}"
+                        f"/edge/apis/multi-account-v1/cws/{self.utility.utilitycode()}"
+                        "/customers?offset=0&batchSize=100&addressFilter="
+                    ),
+                    lambda: {},
+                    None,
+                    RequestContext(
+                        purpose=RequestPurpose.CUSTOMERS,
+                        stage=FailureStage.CUSTOMERS,
+                        authentication=AuthenticationExpectation.REAUTHENTICATE_ON_401,
+                    ),
+                )
                 for customer in result["customers"]:
                     self.customers.append(customer)
             except ApiException as err:
@@ -475,10 +518,19 @@ class Opower:
         # Bearer token auth). Fall back to accountId if unavailable.
         customer_uuid: str = getattr(self.utility, "_web_user_id", None) or account_id
 
-        sa_url = (
-            f"https://{self._get_subdomain()}.opower.com/{self._get_api_root()}/edge/apis/bill-trends-v1/cws/serviceAgreements"
+        sa_result = await self._async_get_request(
+            lambda: (
+                f"https://{self._get_subdomain()}.opower.com/{self._get_api_root()}"
+                "/edge/apis/bill-trends-v1/cws/serviceAgreements"
+            ),
+            lambda: {},
+            None,
+            RequestContext(
+                purpose=RequestPurpose.SERVICE_AGREEMENTS,
+                stage=FailureStage.ACCOUNTS,
+                authentication=AuthenticationExpectation.REAUTHENTICATE_ON_401,
+            ),
         )
-        sa_result = await self._async_get_request(sa_url, {}, self._get_headers())
 
         utility_accounts: list[Any] = []
         for sa in sa_result.get("serviceAgreements", []):
@@ -511,15 +563,20 @@ class Opower:
         """Get accounts associated to the user."""
         # Cache the accounts
         if not self.user_accounts:
-            url = (
-                "https://"
-                f"{self._get_subdomain()}"
-                ".opower.com/"
-                f"{self._get_api_root()}"
-                "/edge/apis/dss-invite-v1/cws/v1/utilities/connectedaccounts?"
-                "pageOffset=0&pageLimit=100"
+            result = await self._async_get_request(
+                lambda: (
+                    f"https://{self._get_subdomain()}.opower.com/{self._get_api_root()}"
+                    "/edge/apis/dss-invite-v1/cws/v1/utilities/connectedaccounts?"
+                    "pageOffset=0&pageLimit=100"
+                ),
+                lambda: {},
+                None,
+                RequestContext(
+                    purpose=RequestPurpose.USER_ACCOUNTS,
+                    stage=FailureStage.ACCOUNTS,
+                    authentication=AuthenticationExpectation.REAUTHENTICATE_ON_401,
+                ),
             )
-            result = await self._async_get_request(url, {}, self._get_headers())
             for account in result["accounts"]:
                 self.user_accounts.append(account)
 
@@ -603,13 +660,20 @@ class Opower:
         Each meter is a string key for fetching from the realtime data API.
         """
         if not self.meters:
-            url = (
-                f"https://{self._get_subdomain()}.opower.com/{self._get_api_root()}"
-                f"/edge/apis/cws-real-time-ami-v1/cws/{self.utility.utilitycode()}"
-                f"/accounts/{account.uuid}/meters"
+            result = await self._async_get_request(
+                lambda: (
+                    f"https://{self._get_subdomain()}.opower.com/{self._get_api_root()}"
+                    f"/edge/apis/cws-real-time-ami-v1/cws/{self.utility.utilitycode()}"
+                    f"/accounts/{account.uuid}/meters"
+                ),
+                lambda: {},
+                account.customer.uuid,
+                RequestContext(
+                    purpose=RequestPurpose.METERS,
+                    stage=FailureStage.REALTIME_READS,
+                    authentication=AuthenticationExpectation.REAUTHENTICATE_ON_401,
+                ),
             )
-            headers = self._get_headers(account.customer.uuid)
-            result = await self._async_get_request(url, {}, headers)
             self.meters = list(result["meters_ids"])
         return self.meters
 
@@ -630,13 +694,20 @@ class Opower:
         assert len(meters) > 0
         meter = meters[0]
 
-        url = (
-            f"https://{self._get_subdomain()}.opower.com/{self._get_api_root()}"
-            f"/edge/apis/cws-real-time-ami-v1/cws/{self.utility.utilitycode()}"
-            f"/accounts/{account.uuid}/meters/{meter}/usage"
+        result = await self._async_get_request(
+            lambda: (
+                f"https://{self._get_subdomain()}.opower.com/{self._get_api_root()}"
+                f"/edge/apis/cws-real-time-ami-v1/cws/{self.utility.utilitycode()}"
+                f"/accounts/{account.uuid}/meters/{meter}/usage"
+            ),
+            lambda: {},
+            account.customer.uuid,
+            RequestContext(
+                purpose=RequestPurpose.REALTIME_USAGE,
+                stage=FailureStage.REALTIME_READS,
+                authentication=AuthenticationExpectation.REAUTHENTICATE_ON_401,
+            ),
         )
-        headers = self._get_headers(account.customer.uuid)
-        result = await self._async_get_request(url, {}, headers)
         tz = await aiozoneinfo.async_get_time_zone(self.utility.timezone())
         return [
             UsageRead(
@@ -706,8 +777,18 @@ class Opower:
         is intentionally omitted: bill data is always returned in full because
         monthly billing cycles rarely align with the caller's requested window.
         """
-        url = f"https://{self._get_subdomain()}.opower.com/{self._get_api_root()}/edge/apis/bill-trends-v1/cws/billHistory"
-        result = await self._async_get_request(url, {"numMonths": "36"}, self._get_headers())
+        result = await self._async_get_request(
+            lambda: (
+                f"https://{self._get_subdomain()}.opower.com/{self._get_api_root()}/edge/apis/bill-trends-v1/cws/billHistory"
+            ),
+            lambda: {"numMonths": "36"},
+            None,
+            RequestContext(
+                purpose=RequestPurpose.BILL_HISTORY,
+                stage=FailureStage.COST_READS,
+                authentication=AuthenticationExpectation.REAUTHENTICATE_ON_401,
+            ),
+        )
 
         bills = result.get("bills", [])
         if len(bills) < 2:
@@ -744,26 +825,34 @@ class Opower:
         end_date: datetime | arrow.Arrow | None = None,
         usage_only: bool = False,
     ) -> list[Any]:
-        if usage_only:
-            url = (
-                f"https://{self._get_subdomain()}.opower.com/{self._get_api_root()}"
-                f"/edge/apis/DataBrowser-v1/cws/utilities/{self.utility.utilitycode()}"
-                f"/utilityAccounts/{account.uuid}/reads"
-            )
-        else:
-            url = (
-                f"https://{self._get_subdomain()}.opower.com/{self._get_api_root()}"
-                f"/edge/apis/DataBrowser-v1/cws/cost/utilityAccount/{account.uuid}"
-            )
         convert_to_date = usage_only
         params = {"aggregateType": aggregate_type.value}
-        headers = self._get_headers(account.customer.uuid)
         if start_date:
             params["startDate"] = (start_date.date() if convert_to_date else start_date).isoformat()
         if end_date:
             params["endDate"] = (end_date.date() if convert_to_date else end_date).isoformat()
         try:
-            result = await self._async_get_request(url, params, headers)
+            result = await self._async_get_request(
+                lambda: (
+                    (
+                        f"https://{self._get_subdomain()}.opower.com/{self._get_api_root()}"
+                        f"/edge/apis/DataBrowser-v1/cws/utilities/{self.utility.utilitycode()}"
+                        f"/utilityAccounts/{account.uuid}/reads"
+                    )
+                    if usage_only
+                    else (
+                        f"https://{self._get_subdomain()}.opower.com/{self._get_api_root()}"
+                        f"/edge/apis/DataBrowser-v1/cws/cost/utilityAccount/{account.uuid}"
+                    )
+                ),
+                lambda: dict(params),
+                account.customer.uuid,
+                RequestContext(
+                    purpose=RequestPurpose.DATA_BROWSER,
+                    stage=FailureStage.USAGE_READS if usage_only else FailureStage.COST_READS,
+                    authentication=AuthenticationExpectation.REAUTHENTICATE_ON_401,
+                ),
+            )
             return list(result["reads"])
         except ApiException as err:
             # Ignore server errors for BILL requests
@@ -823,12 +912,37 @@ class Opower:
 
     async def _async_get_request(
         self,
+        url_factory: Callable[[], str],
+        params_factory: Callable[[], dict[str, str]],
+        customer_uuid: str | None,
+        context: RequestContext,
+    ) -> Any:
+        """Build and issue a fresh authenticated GET for each attempt."""
+        operation_id = new_correlation_id()
+
+        async def request() -> Any:
+            url = url_factory()
+            params = params_factory()
+            headers = self._get_headers(customer_uuid)
+            return await self._async_get_request_once(
+                url,
+                params,
+                headers,
+                context,
+                operation_id,
+            )
+
+        return await self._async_authenticated_request(request, context=context)
+
+    async def _async_get_request_once(
+        self,
         url: str,
         params: dict[str, str],
         headers: dict[str, str],
-        stage: FailureStage = FailureStage.UNKNOWN,
+        context: RequestContext,
+        operation_id: str,
     ) -> Any:
-        operation_id = new_correlation_id()
+        """Issue one GET without authentication recovery."""
         full_url = f"{url}?{urlencode(params)}"
         _LOGGER.debug("Fetching: %s", full_url)
         try:
@@ -842,11 +956,7 @@ class Opower:
                         response_summary=summary.as_safe_metadata(),
                         details=classify_http_failure(
                             summary,
-                            RequestContext(
-                                purpose=RequestPurpose.GENERIC_API,
-                                stage=stage,
-                                authentication=AuthenticationExpectation.REAUTHENTICATE_ON_401,
-                            ),
+                            context,
                             operation_id=operation_id,
                         ),
                     )
@@ -858,10 +968,41 @@ class Opower:
         except ClientError as e:
             raise ApiException(f"Client Error: {e}", url=full_url) from e
 
-    async def _async_post_graphql(self, query: str, headers: dict[str, str]) -> Any:
-        """Execute a GraphQL query against the Opower API."""
+    async def _async_post_graphql(
+        self,
+        query: str,
+        customer_uuid: str,
+    ) -> Any:
+        """Execute GraphQL through the common authenticated request layer."""
         operation_id = new_correlation_id()
-        url = f"https://{self._get_subdomain()}.opower.com/{self._get_api_root()}/edge/apis/dsm-graphql-v1/cws/graphql"
+        context = RequestContext(
+            purpose=RequestPurpose.FORECAST_GRAPHQL,
+            stage=FailureStage.GRAPHQL,
+            authentication=AuthenticationExpectation.REAUTHENTICATE_ON_401,
+        )
+
+        async def request() -> Any:
+            url = f"https://{self._get_subdomain()}.opower.com/{self._get_api_root()}/edge/apis/dsm-graphql-v1/cws/graphql"
+            headers = self._get_headers(customer_uuid)
+            return await self._async_post_graphql_once(
+                url,
+                query,
+                headers,
+                context,
+                operation_id,
+            )
+
+        return await self._async_authenticated_request(request, context=context)
+
+    async def _async_post_graphql_once(
+        self,
+        url: str,
+        query: str,
+        headers: dict[str, str],
+        context: RequestContext,
+        operation_id: str,
+    ) -> Any:
+        """Issue one GraphQL POST without authentication recovery."""
         _LOGGER.debug("GraphQL query to: %s", url)
         try:
             async with self.session.post(
@@ -878,11 +1019,7 @@ class Opower:
                         response_summary=summary.as_safe_metadata(),
                         details=classify_http_failure(
                             summary,
-                            RequestContext(
-                                purpose=RequestPurpose.FORECAST_GRAPHQL,
-                                stage=FailureStage.GRAPHQL,
-                                authentication=AuthenticationExpectation.REAUTHENTICATE_ON_401,
-                            ),
+                            context,
                             operation_id=operation_id,
                         ),
                     )
@@ -910,3 +1047,31 @@ class Opower:
                 return result
         except ClientError as e:
             raise ApiException(f"Client Error: {e}", url=url) from e
+
+    async def _async_authenticated_request(
+        self,
+        request: Callable[[], Awaitable[_ResponseT]],
+        *,
+        context: RequestContext,
+    ) -> _ResponseT:
+        """Replay a fresh request once after evidence-backed session expiration."""
+        progress = await self.async_ensure_authenticated()
+        generation = progress.generation
+        for attempt in range(2):
+            try:
+                return await request()
+            except ApiException as error:
+                if (
+                    attempt
+                    or error.details is None
+                    or error.details.category is not FailureCategory.SESSION_EXPIRED
+                    or context.authentication is not AuthenticationExpectation.REAUTHENTICATE_ON_401
+                ):
+                    raise
+                await self._authentication_gate.async_invalidate(
+                    AuthenticationResetReason.SESSION_EXPIRED,
+                    expected_generation=generation,
+                )
+                progress = await self.async_ensure_authenticated()
+                generation = progress.generation
+        raise AssertionError("authenticated request retry loop exhausted")

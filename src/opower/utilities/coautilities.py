@@ -49,6 +49,10 @@ class COAUtilities(UtilityBase):
         """COA DSS uses SAML-only sessions so DataBrowser-v1 is inaccessible via Bearer token."""
         return True
 
+    def clear_authentication_state(self) -> None:
+        """Clear the user identifier captured from the current SSO session."""
+        self._web_user_id = None
+
     async def async_login(
         self,
         session: aiohttp.ClientSession,

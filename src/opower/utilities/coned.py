@@ -1,5 +1,6 @@
 """Consolidated Edison (ConEd)."""
 
+import datetime
 from typing import Any
 
 import aiohttp
@@ -66,6 +67,11 @@ class ConEd(UtilityBase):
         """Check if Utility supports realtime usage reads."""
         return True
 
+    @staticmethod
+    def authentication_timeout() -> datetime.timedelta:
+        """Allow a bounded fresh-TOTP wait within a complete ConEd transaction."""
+        return datetime.timedelta(seconds=180)
+
     async def async_login(
         self,
         session: aiohttp.ClientSession,
@@ -74,6 +80,11 @@ class ConEd(UtilityBase):
         login_data: dict[str, Any],
     ) -> str:
         """Login to the utility website."""
+        if self._authentication_context:
+            await self._authentication_context.async_update_progress(
+                FailureStage.LOGIN,
+                message_key="coned_login_started",
+            )
         hostname = self.hostname()
         login_base = "https://www." + hostname + "/sitecore/api/ssc/ConEdWeb-Foundation-Login-Areas-LoginAPI/User/0"
         login_headers = {
@@ -96,6 +107,7 @@ class ConEd(UtilityBase):
             },
             headers=login_headers,
             raise_for_status=False,
+            timeout=aiohttp.ClientTimeout(total=30),
         ) as resp:
             _raise_for_http_failure(resp, FailureStage.LOGIN)
             login_response = parse_login_response(await resp.json())
@@ -114,7 +126,34 @@ class ConEd(UtilityBase):
                         ),
                     )
 
-                mfa_code = pyotp.TOTP(self._totp_secret).now()
+                totp = pyotp.TOTP(self._totp_secret)
+                now = datetime.datetime.now(datetime.UTC)
+                totp_counter = totp.timecode(now)
+                retry_at = datetime.datetime.fromtimestamp(
+                    (totp_counter + 1) * totp.interval,
+                    tz=datetime.UTC,
+                )
+                if self._authentication_context:
+                    await self._authentication_context.async_update_progress(
+                        FailureStage.MFA_GENERATION,
+                        message_key="generating_totp",
+                    )
+                    await self._authentication_context.async_prepare_totp(
+                        totp_counter,
+                        retry_at,
+                    )
+                    now = datetime.datetime.now(datetime.UTC)
+                    totp_counter = totp.timecode(now)
+                    retry_at = datetime.datetime.fromtimestamp(
+                        (totp_counter + 1) * totp.interval,
+                        tz=datetime.UTC,
+                    )
+                    await self._authentication_context.async_mark_totp_submitted(totp_counter)
+                    await self._authentication_context.async_update_progress(
+                        FailureStage.MFA_VERIFICATION,
+                        message_key="submitting_totp",
+                    )
+                mfa_code = totp.at(now)
 
                 async with session.post(
                     login_base + "/VerifyFactor",
@@ -125,10 +164,14 @@ class ConEd(UtilityBase):
                         "OpenIdRelayState": "",
                     },
                     raise_for_status=False,
+                    timeout=aiohttp.ClientTimeout(total=30),
                 ) as resp:  # noqa: PLW2901
                     _raise_for_http_failure(resp, FailureStage.MFA_VERIFICATION)
                     factor_response = parse_factor_response(await resp.json())
-                    raise_for_factor_rejection(factor_response)
+                    raise_for_factor_rejection(
+                        factor_response,
+                        retry_at=retry_at,
+                    )
                     redirect_url = factor_response.auth_redirect_url
 
             if redirect_url is None:
@@ -141,6 +184,11 @@ class ConEd(UtilityBase):
                         message_key="coned_auth_redirect_missing",
                     ),
                 )
+            if self._authentication_context:
+                await self._authentication_context.async_update_progress(
+                    FailureStage.AUTH_REDIRECT,
+                    message_key="following_authentication_redirect",
+                )
             async with session.get(
                 redirect_url,
                 headers={
@@ -148,15 +196,22 @@ class ConEd(UtilityBase):
                 },
                 allow_redirects=True,
                 raise_for_status=False,
+                timeout=aiohttp.ClientTimeout(total=45),
             ) as resp:  # noqa: PLW2901
                 _raise_for_http_failure(resp, FailureStage.AUTH_REDIRECT)
 
+        if self._authentication_context:
+            await self._authentication_context.async_update_progress(
+                FailureStage.TOKEN_EXCHANGE,
+                message_key="requesting_opower_token",
+            )
         async with session.get(
             "https://www."
             + hostname
             + "/sitecore/api/ssc/ConEd-Cms-Services-Controllers-Opower/OpowerService/0/GetOPowerToken",
             headers=login_headers,
             raise_for_status=False,
+            timeout=aiohttp.ClientTimeout(total=30),
         ) as resp:
             _raise_for_http_failure(resp, FailureStage.TOKEN_EXCHANGE)
             return str(await resp.json())

@@ -1,5 +1,11 @@
 """Library for getting historical and forecasted usage/cost from an utility using opower.com JSON API."""
 
+from .authentication import (
+    AuthenticationAttemptContext,
+    AuthenticationGate,
+    AuthenticationProgress,
+    AuthenticationResetReason,
+)
 from .exceptions import (
     ApiException,
     AuthenticationAttemptSuperseded,
@@ -43,9 +49,13 @@ __all__ = [
     "Account",
     "AggregateType",
     "ApiException",
+    "AuthenticationAttemptContext",
     "AuthenticationAttemptSuperseded",
     "AuthenticationError",
     "AuthenticationExpectation",
+    "AuthenticationGate",
+    "AuthenticationProgress",
+    "AuthenticationResetReason",
     "AuthenticationTimeout",
     "CannotConnect",
     "CostRead",
