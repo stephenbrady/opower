@@ -6,7 +6,9 @@ import typing
 import opower.utilities.base
 from opower import (
     ApiException,
+    AuthenticationAttemptSuperseded,
     AuthenticationError,
+    AuthenticationTimeout,
     CannotConnect,
     FailureCategory,
     FailureDetails,
@@ -20,6 +22,7 @@ from opower import (
     ProtocolError,
     RateLimited,
     RetryDisposition,
+    SafeHttpMetadata,
     TemporaryAuthenticationError,
 )
 
@@ -43,11 +46,17 @@ def test_failure_details_as_dict() -> None:
         stage=FailureStage.LOGIN,
         retry=RetryDisposition.RETRY_AFTER,
         message_key="rate_limited",
-        http_status=429,
         provider_code="TOO_MANY_ATTEMPTS",
         retry_at=retry_at,
         attempt_id="53d9c42c-fd03-44e6-bcb5-dc9b5662d100",
         operation_id="cb63af11-d13d-4856-9869-77dd84d2233a",
+        http=SafeHttpMetadata(
+            status=429,
+            content_type="application/json",
+            schema=("code",),
+            request_id="request-123",
+            retry_at=retry_at,
+        ),
     )
 
     assert details.as_dict() == {
@@ -55,16 +64,17 @@ def test_failure_details_as_dict() -> None:
         "stage": "login",
         "retry": "retry_after",
         "message_key": "rate_limited",
-        "http_status": 429,
         "provider_code": "TOO_MANY_ATTEMPTS",
-        "provider_message": None,
         "retry_at": "2026-07-22T18:45:00+00:00",
         "attempt_id": "53d9c42c-fd03-44e6-bcb5-dc9b5662d100",
         "operation_id": "cb63af11-d13d-4856-9869-77dd84d2233a",
-        "response_content_type": None,
-        "response_schema": None,
-        "server_request_id": None,
-        "diagnostics": None,
+        "http": {
+            "status": 429,
+            "content_type": "application/json",
+            "schema": ("code",),
+            "request_id": "request-123",
+            "retry_at": "2026-07-22T18:45:00+00:00",
+        },
     }
 
 
@@ -75,6 +85,9 @@ def test_legacy_exception_hierarchy_is_preserved() -> None:
     temporary_failure = TemporaryAuthenticationError("provider unavailable")
     rate_limited = RateLimited("retry later")
     protocol_error = ProtocolError("unexpected response")
+    mfa_rejected = MfaCodeRejected("MFA transaction rejected")
+    superseded = AuthenticationAttemptSuperseded("attempt replaced")
+    timeout = AuthenticationTimeout("attempt timed out")
 
     assert isinstance(invalid_credentials, InvalidAuth)
     assert isinstance(invalid_credentials, AuthenticationError)
@@ -83,6 +96,10 @@ def test_legacy_exception_hierarchy_is_preserved() -> None:
     assert isinstance(temporary_failure, CannotConnect)
     assert isinstance(rate_limited, CannotConnect)
     assert isinstance(protocol_error, OpowerError)
+    assert isinstance(protocol_error, CannotConnect)
+    assert isinstance(mfa_rejected, CannotConnect)
+    assert isinstance(superseded, CannotConnect)
+    assert isinstance(timeout, CannotConnect)
 
 
 def test_opower_error_exposes_optional_details() -> None:
@@ -114,6 +131,7 @@ def test_mfa_code_rejected_is_not_legacy_invalid_auth() -> None:
     error = MfaCodeRejected("MFA transaction rejected")
 
     assert isinstance(error, AuthenticationError)
+    assert isinstance(error, CannotConnect)
     assert not isinstance(error, InvalidAuth)
 
 
@@ -124,11 +142,13 @@ def test_api_exception_constructor_and_rendering_remain_compatible() -> None:
         url="https://example.invalid/endpoint",
         status=500,
         response_text="temporary provider failure",
+        response_summary=SafeHttpMetadata(status=500),
     )
 
     assert error.url == "https://example.invalid/endpoint"
     assert error.status == 500
     assert error.response_text == "temporary provider failure"
+    assert error.response_summary == SafeHttpMetadata(status=500)
     assert (
         str(error)
         == "HTTP Error: 500\nURL: https://example.invalid/endpoint\nStatus: 500\nResponse: temporary provider failure"

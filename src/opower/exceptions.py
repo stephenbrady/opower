@@ -19,6 +19,7 @@ class FailureCategory(StrEnum):
     MFA_REPLAY_PREVENTED = "mfa_replay_prevented"
     RATE_LIMITED = "rate_limited"
     SESSION_EXPIRED = "session_expired"
+    AUTHENTICATION_RESET = "authentication_reset"
     PROVIDER_UNAVAILABLE = "provider_unavailable"
     TRANSPORT = "transport"
     PROTOCOL = "protocol"
@@ -58,6 +59,27 @@ class RetryDisposition(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class SafeHttpMetadata:
+    """Non-secret metadata describing an HTTP response."""
+
+    status: int
+    content_type: str | None = None
+    schema: tuple[str, ...] | None = None
+    request_id: str | None = None
+    retry_at: datetime | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return JSON-serializable safe response metadata."""
+        return {
+            "status": self.status,
+            "content_type": self.content_type,
+            "schema": self.schema,
+            "request_id": self.request_id,
+            "retry_at": self.retry_at.isoformat() if self.retry_at else None,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class FailureDetails:
     """Safe, machine-readable details attached to an Opower failure."""
 
@@ -65,16 +87,11 @@ class FailureDetails:
     stage: FailureStage
     retry: RetryDisposition
     message_key: str
-    http_status: int | None = None
     provider_code: str | None = None
-    provider_message: str | None = None
     retry_at: datetime | None = None
     attempt_id: str | None = None
     operation_id: str | None = None
-    response_content_type: str | None = None
-    response_schema: tuple[str, ...] | None = None
-    server_request_id: str | None = None
-    diagnostics: dict[str, Any] | None = None
+    http: SafeHttpMetadata | None = None
 
     def as_dict(self) -> dict[str, Any]:
         """Return JSON-serializable failure details."""
@@ -83,6 +100,7 @@ class FailureDetails:
         result["stage"] = self.stage.value
         result["retry"] = self.retry.value
         result["retry_at"] = self.retry_at.isoformat() if self.retry_at else None
+        result["http"] = self.http.as_dict() if self.http else None
         return result
 
 
@@ -120,19 +138,27 @@ class PasswordExpired(InvalidAuth):
     """The provider reports that the password has expired."""
 
 
-class MfaCodeRejected(AuthenticationError):
+class TemporaryAuthenticationError(CannotConnect, AuthenticationError):
+    """Authentication failed for a temporary or ambiguous reason."""
+
+
+class MfaCodeRejected(TemporaryAuthenticationError):
     """The provider rejected an MFA transaction without proving bad credentials."""
 
 
-class TemporaryAuthenticationError(CannotConnect, AuthenticationError):
-    """Authentication failed for a temporary or ambiguous reason."""
+class AuthenticationAttemptSuperseded(TemporaryAuthenticationError):
+    """The shared authentication attempt was explicitly replaced."""
+
+
+class AuthenticationTimeout(TemporaryAuthenticationError):
+    """The shared authentication transaction exceeded its deadline."""
 
 
 class RateLimited(CannotConnect):
     """The provider requires waiting before another attempt."""
 
 
-class ProtocolError(OpowerError):
+class ProtocolError(CannotConnect):
     """The provider response did not match the expected protocol."""
 
 
@@ -162,12 +188,16 @@ class ApiException(OpowerError):
         response_text: str | None = None,
         *,
         details: FailureDetails | None = None,
+        response_summary: SafeHttpMetadata | None = None,
     ) -> None:
         """Initialize the exception."""
         super().__init__(message, details=details)
         self.url = url
         self.status = status
+        # Deprecated compatibility attribute. Internal code must not store raw
+        # provider bodies here.
         self.response_text = response_text
+        self.response_summary = response_summary
 
     def __str__(self) -> str:
         """Return a string representation of the exception."""

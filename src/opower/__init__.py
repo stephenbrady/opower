@@ -2,7 +2,9 @@
 
 from .exceptions import (
     ApiException,
+    AuthenticationAttemptSuperseded,
     AuthenticationError,
+    AuthenticationTimeout,
     CannotConnect,
     FailureCategory,
     FailureDetails,
@@ -16,6 +18,7 @@ from .exceptions import (
     ProtocolError,
     RateLimited,
     RetryDisposition,
+    SafeHttpMetadata,
     TemporaryAuthenticationError,
 )
 from .helpers import create_cookie_jar
@@ -39,7 +42,9 @@ __all__ = [
     "Account",
     "AggregateType",
     "ApiException",
+    "AuthenticationAttemptSuperseded",
     "AuthenticationError",
+    "AuthenticationTimeout",
     "CannotConnect",
     "CostRead",
     "FailureCategory",
@@ -59,6 +64,7 @@ __all__ = [
     "RateLimited",
     "ReadResolution",
     "RetryDisposition",
+    "SafeHttpMetadata",
     "TemporaryAuthenticationError",
     "UnitOfMeasure",
     "UsageRead",
