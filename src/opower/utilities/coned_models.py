@@ -1,6 +1,7 @@
 """Validated, non-secret ConEd login response models."""
 
 import dataclasses
+import datetime
 from collections.abc import Mapping
 from typing import Any
 
@@ -8,18 +9,12 @@ from ..exceptions import (
     FailureCategory,
     FailureDetails,
     FailureStage,
-    InvalidCredentials,
     MfaCodeRejected,
     PasswordExpired,
     ProtocolError,
-    RateLimited,
     RetryDisposition,
     TemporaryAuthenticationError,
 )
-
-_INVALID_CREDENTIAL_CODES = frozenset({"INVALID_CREDENTIALS", "INVALID_PASSWORD", "INVALID_USERNAME"})
-_PASSWORD_EXPIRED_CODES = frozenset({"PASSWORD_EXPIRED", "PASSWORD_RESET_REQUIRED"})
-_RATE_LIMITED_CODES = frozenset({"RATE_LIMITED", "TOO_MANY_ATTEMPTS", "TOO_MANY_REQUESTS"})
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -28,9 +23,12 @@ class ConEdLoginResponse:
 
     accepted: bool
     auth_redirect_url: str | None
+    expired_password: bool
+    waiting_time: datetime.timedelta | None
     new_device: bool
     no_mfa: bool
-    provider_code: str | None
+    enable_resend_mfa_code: bool
+    is_numeric: bool
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -39,7 +37,7 @@ class ConEdFactorResponse:
 
     accepted: bool
     auth_redirect_url: str | None
-    provider_code: str | None
+    is_password_expired: bool
 
 
 def parse_login_response(payload: object) -> ConEdLoginResponse:
@@ -49,9 +47,12 @@ def parse_login_response(payload: object) -> ConEdLoginResponse:
     return ConEdLoginResponse(
         accepted=accepted,
         auth_redirect_url=_optional_string(data, "authRedirectUrl", "login"),
+        expired_password=_optional_bool(data, "expiredPassword", False, "login"),
+        waiting_time=_optional_milliseconds(data, "waitingTime", "login"),
         new_device=_optional_bool(data, "newDevice", False, "login"),
         no_mfa=_optional_bool(data, "noMfa", False, "login"),
-        provider_code=_safe_provider_code(data.get("code")),
+        enable_resend_mfa_code=_optional_bool(data, "enableResendMfaCode", False, "login"),
+        is_numeric=_optional_bool(data, "isNumeric", False, "login"),
     )
 
 
@@ -62,26 +63,50 @@ def parse_factor_response(payload: object) -> ConEdFactorResponse:
     return ConEdFactorResponse(
         accepted=accepted,
         auth_redirect_url=_optional_string(data, "authRedirectUrl", "MFA verification"),
-        provider_code=_safe_provider_code(data.get("status") or data.get("errorCode")),
+        is_password_expired=_optional_bool(data, "isPasswordExpired", False, "MFA verification"),
     )
 
 
 def raise_for_login_rejection(response: ConEdLoginResponse) -> None:
     """Raise only evidence-backed credential errors for a rejected login."""
-    if response.accepted:
-        return
-    details = _failure_details(response.provider_code, FailureStage.LOGIN)
-    if response.provider_code in _INVALID_CREDENTIAL_CODES:
-        raise InvalidCredentials("ConEd rejected the username or password", details=details)
-    if response.provider_code in _PASSWORD_EXPIRED_CODES:
-        raise PasswordExpired("ConEd requires a password change", details=details)
-    if response.provider_code in _RATE_LIMITED_CODES:
-        raise RateLimited("ConEd temporarily limited login attempts", details=details)
-    raise TemporaryAuthenticationError("ConEd rejected the login transaction without a credential error code", details=details)
+    if response.expired_password:
+        raise PasswordExpired(
+            "ConEd requires a password change",
+            details=FailureDetails(
+                category=FailureCategory.PASSWORD_EXPIRED,
+                stage=FailureStage.LOGIN,
+                retry=RetryDisposition.USER_ACTION_REQUIRED,
+                message_key="coned_password_expired",
+            ),
+        )
+    if not response.accepted:
+        raise TemporaryAuthenticationError(
+            "ConEd rejected the login transaction without evidence of invalid credentials",
+            details=FailureDetails(
+                category=FailureCategory.PROVIDER_UNAVAILABLE,
+                stage=FailureStage.LOGIN,
+                retry=RetryDisposition.RETRY_WITH_BACKOFF,
+                message_key="coned_login_rejected",
+            ),
+        )
 
 
-def raise_for_factor_rejection(response: ConEdFactorResponse) -> None:
+def raise_for_factor_rejection(
+    response: ConEdFactorResponse,
+    *,
+    retry_at: datetime.datetime | None = None,
+) -> None:
     """Treat a factor rejection as retryable unless ConEd proves a configuration error."""
+    if response.is_password_expired:
+        raise PasswordExpired(
+            "ConEd requires a password change",
+            details=FailureDetails(
+                category=FailureCategory.PASSWORD_EXPIRED,
+                stage=FailureStage.MFA_VERIFICATION,
+                retry=RetryDisposition.USER_ACTION_REQUIRED,
+                message_key="coned_password_expired",
+            ),
+        )
     if response.accepted:
         return
     details = FailureDetails(
@@ -89,35 +114,9 @@ def raise_for_factor_rejection(response: ConEdFactorResponse) -> None:
         stage=FailureStage.MFA_VERIFICATION,
         retry=RetryDisposition.RETRY_AFTER_TOTP_ROLLOVER,
         message_key="coned_mfa_transaction_rejected",
-        provider_code=response.provider_code,
+        retry_at=retry_at,
     )
     raise MfaCodeRejected("ConEd rejected the MFA transaction; retry with a fresh TOTP window", details=details)
-
-
-def _failure_details(provider_code: str | None, stage: FailureStage) -> FailureDetails:
-    """Return details based solely on safe, recognized provider codes."""
-    category = FailureCategory.PROVIDER_UNAVAILABLE
-    retry = RetryDisposition.RETRY_WITH_BACKOFF
-    message_key = "coned_login_rejected"
-    if provider_code in _INVALID_CREDENTIAL_CODES:
-        category = FailureCategory.INVALID_CREDENTIALS
-        retry = RetryDisposition.USER_ACTION_REQUIRED
-        message_key = "coned_invalid_credentials"
-    elif provider_code in _PASSWORD_EXPIRED_CODES:
-        category = FailureCategory.PASSWORD_EXPIRED
-        retry = RetryDisposition.USER_ACTION_REQUIRED
-        message_key = "coned_password_expired"
-    elif provider_code in _RATE_LIMITED_CODES:
-        category = FailureCategory.RATE_LIMITED
-        retry = RetryDisposition.RETRY_WITH_BACKOFF
-        message_key = "coned_rate_limited"
-    return FailureDetails(
-        category=category,
-        stage=stage,
-        retry=retry,
-        message_key=message_key,
-        provider_code=provider_code,
-    )
 
 
 def _require_mapping(payload: object, stage: str) -> Mapping[str, Any]:
@@ -155,13 +154,21 @@ def _optional_string(data: Mapping[str, Any], key: str, stage: str) -> str | Non
     return value
 
 
-def _safe_provider_code(value: object) -> str | None:
-    """Retain only known, non-secret provider codes."""
-    if not isinstance(value, str):
+def _optional_milliseconds(
+    data: Mapping[str, Any],
+    key: str,
+    stage: str,
+) -> datetime.timedelta | None:
+    """Read an optional non-negative millisecond duration."""
+    value = data.get(key)
+    if value is None:
         return None
-    normalized = value.strip().upper()
-    known_codes = _INVALID_CREDENTIAL_CODES | _PASSWORD_EXPIRED_CODES | _RATE_LIMITED_CODES
-    return normalized if normalized in known_codes else None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ProtocolError(
+            f"ConEd {stage} response field {key!r} was not non-negative milliseconds",
+            details=_protocol_details(stage),
+        )
+    return datetime.timedelta(milliseconds=value)
 
 
 def _protocol_details(stage: str) -> FailureDetails:

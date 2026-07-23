@@ -6,7 +6,23 @@ import aiohttp
 import pyotp
 
 from ..const import USER_AGENT
-from ..exceptions import FailureCategory, FailureDetails, FailureStage, InvalidAuth, ProtocolError, RetryDisposition
+from ..exceptions import (
+    FailureCategory,
+    FailureDetails,
+    FailureStage,
+    InvalidAuth,
+    ProtocolError,
+    RateLimited,
+    RetryDisposition,
+    TemporaryAuthenticationError,
+)
+from ..http_response import (
+    AuthenticationExpectation,
+    RequestContext,
+    RequestPurpose,
+    classify_http_failure,
+    summarize_response,
+)
 from .base import UtilityBase
 from .coned_models import (
     parse_factor_response,
@@ -79,8 +95,9 @@ class ConEd(UtilityBase):
                 "OpenIdRelayState": "",
             },
             headers=login_headers,
-            raise_for_status=True,
+            raise_for_status=False,
         ) as resp:
+            _raise_for_http_failure(resp, FailureStage.LOGIN)
             login_response = parse_login_response(await resp.json())
             raise_for_login_rejection(login_response)
 
@@ -107,8 +124,9 @@ class ConEd(UtilityBase):
                         "ReturnUrl": RETURN_URL,
                         "OpenIdRelayState": "",
                     },
-                    raise_for_status=True,
+                    raise_for_status=False,
                 ) as resp:  # noqa: PLW2901
+                    _raise_for_http_failure(resp, FailureStage.MFA_VERIFICATION)
                     factor_response = parse_factor_response(await resp.json())
                     raise_for_factor_rejection(factor_response)
                     redirect_url = factor_response.auth_redirect_url
@@ -129,15 +147,37 @@ class ConEd(UtilityBase):
                     "User-Agent": USER_AGENT,
                 },
                 allow_redirects=True,
-                raise_for_status=True,
+                raise_for_status=False,
             ) as resp:  # noqa: PLW2901
-                pass
+                _raise_for_http_failure(resp, FailureStage.AUTH_REDIRECT)
 
         async with session.get(
             "https://www."
             + hostname
             + "/sitecore/api/ssc/ConEd-Cms-Services-Controllers-Opower/OpowerService/0/GetOPowerToken",
             headers=login_headers,
-            raise_for_status=True,
+            raise_for_status=False,
         ) as resp:
+            _raise_for_http_failure(resp, FailureStage.TOKEN_EXCHANGE)
             return str(await resp.json())
+
+
+def _raise_for_http_failure(
+    response: aiohttp.ClientResponse,
+    stage: FailureStage,
+) -> None:
+    """Raise a retryable, structured ConEd HTTP failure with safe metadata."""
+    if response.ok:
+        return
+    summary = summarize_response(response)
+    details = classify_http_failure(
+        summary,
+        RequestContext(
+            purpose=RequestPurpose.LOGIN,
+            stage=stage,
+            authentication=AuthenticationExpectation.NO_AUTOMATIC_REAUTHENTICATION,
+        ),
+    )
+    if details.category is FailureCategory.RATE_LIMITED:
+        raise RateLimited("ConEd rate limited an authentication request", details=details)
+    raise TemporaryAuthenticationError("ConEd authentication request failed", details=details)
