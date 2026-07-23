@@ -130,9 +130,7 @@ async def test_customer_scope_and_token_are_rebuilt_after_401() -> None:
     second_headers = session.get_requests[1]["headers"]
     assert first_headers["authorization"] == "Bearer old-token"
     assert second_headers["authorization"] == "Bearer new-token"
-    assert first_headers["Opower-Selected-Entities"] == second_headers[
-        "Opower-Selected-Entities"
-    ]
+    assert first_headers["Opower-Selected-Entities"] == second_headers["Opower-Selected-Entities"]
     assert "customer-uuid" in first_headers["Opower-Selected-Entities"]
 
 
@@ -199,9 +197,7 @@ async def test_graphql_post_rebuilds_request_after_401() -> None:
     assert opower.utility.async_login.await_count == 2  # type: ignore[attr-defined]
     assert session.post_requests[0]["headers"]["authorization"] == "Bearer old-token"
     assert session.post_requests[1]["headers"]["authorization"] == "Bearer new-token"
-    assert "customer-uuid" in session.post_requests[1]["headers"][
-        "Opower-Selected-Entities"
-    ]
+    assert "customer-uuid" in session.post_requests[1]["headers"]["Opower-Selected-Entities"]
 
 
 @pytest.mark.asyncio

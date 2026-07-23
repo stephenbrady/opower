@@ -130,9 +130,7 @@ class AuthenticationGate:
                 self._retry_at = None
                 self._message_key = "authentication_started"
                 context = AuthenticationAttemptContext(self, generation, attempt_id)
-                self._task = asyncio.create_task(
-                    self._async_run(generation, context, authenticate)
-                )
+                self._task = asyncio.create_task(self._async_run(generation, context, authenticate))
                 task = self._task
             generation = self._generation
         try:
@@ -286,9 +284,7 @@ class AuthenticationGate:
     ) -> None:
         """Wait until rollover only when the current counter was already submitted."""
         async with self._state_lock:
-            already_submitted = (
-                generation == self._generation and counter == self._last_totp_counter
-            )
+            already_submitted = generation == self._generation and counter == self._last_totp_counter
         if already_submitted:
             await self._async_wait_until(
                 generation,

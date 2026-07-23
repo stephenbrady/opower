@@ -86,7 +86,7 @@ async def test_successful_coned_login_publishes_complete_progress() -> None:
     assert progress.authenticated
     assert progress.stage is FailureStage.TOKEN_EXCHANGE
     assert progress.message_key == "authentication_complete"
-    assert opower.access_token == "opower-token"
+    assert opower.access_token == "opower-token"  # noqa: S105
     assert [request["method"] for request in session.requests] == [
         "POST",
         "POST",
