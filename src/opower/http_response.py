@@ -3,13 +3,45 @@
 import dataclasses
 import datetime
 import email.utils
+import enum
 import uuid
 from collections.abc import Mapping
 from typing import Any
 
 import aiohttp
 
-from .exceptions import FailureCategory, FailureDetails, FailureStage, RetryDisposition
+from .exceptions import FailureCategory, FailureDetails, FailureStage, RetryDisposition, SafeHttpMetadata
+
+
+class RequestPurpose(enum.StrEnum):
+    """Logical purpose of an Opower HTTP operation."""
+
+    LOGIN = "login"
+    CUSTOMERS = "customers"
+    USER_ACCOUNTS = "user_accounts"
+    SERVICE_AGREEMENTS = "service_agreements"
+    FORECAST_GRAPHQL = "forecast_graphql"
+    DATA_BROWSER = "data_browser"
+    BILL_HISTORY = "bill_history"
+    METERS = "meters"
+    REALTIME_USAGE = "realtime_usage"
+    GENERIC_API = "generic_api"
+
+
+class AuthenticationExpectation(enum.StrEnum):
+    """Whether an HTTP 401 is sufficient evidence to replace authentication."""
+
+    REAUTHENTICATE_ON_401 = "reauthenticate_on_401"
+    NO_AUTOMATIC_REAUTHENTICATION = "no_automatic_reauthentication"
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class RequestContext:
+    """Classification context for one logical HTTP operation."""
+
+    purpose: RequestPurpose
+    stage: FailureStage
+    authentication: AuthenticationExpectation
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -31,6 +63,16 @@ class ResponseSummary:
             "request_id": self.request_id,
             "retry_at": self.retry_at.isoformat() if self.retry_at else None,
         }
+
+    def as_safe_metadata(self) -> SafeHttpMetadata:
+        """Return the public safe metadata representation."""
+        return SafeHttpMetadata(
+            status=self.status,
+            content_type=self.content_type,
+            schema=self.schema,
+            request_id=self.request_id,
+            retry_at=self.retry_at,
+        )
 
 
 def new_correlation_id() -> str:
@@ -67,10 +109,11 @@ def summarize_response(
 
 def classify_http_failure(
     summary: ResponseSummary,
-    stage: FailureStage,
+    context: RequestContext,
     *,
     operation_id: str | None = None,
     attempt_id: str | None = None,
+    provider_session_expired: bool = False,
 ) -> FailureDetails:
     """Classify HTTP status without assuming credentials caused the failure."""
     category = FailureCategory.API
@@ -80,10 +123,16 @@ def classify_http_failure(
         category = FailureCategory.RATE_LIMITED
         retry = RetryDisposition.RETRY_AFTER if summary.retry_at else RetryDisposition.RETRY_WITH_BACKOFF
         message_key = "rate_limited"
-    elif summary.status in (401, 403):
+    elif provider_session_expired or (
+        summary.status == 401 and context.authentication is AuthenticationExpectation.REAUTHENTICATE_ON_401
+    ):
         category = FailureCategory.SESSION_EXPIRED
         retry = RetryDisposition.REAUTHENTICATE_ONCE
-        message_key = "session_not_authorized"
+        message_key = "session_expired"
+    elif summary.status in (401, 403):
+        category = FailureCategory.AUTHORIZATION
+        retry = RetryDisposition.DO_NOT_RETRY
+        message_key = "request_not_authorized"
     elif summary.status >= 500:
         category = FailureCategory.PROVIDER_UNAVAILABLE
         message_key = "provider_unavailable"
@@ -93,17 +142,13 @@ def classify_http_failure(
         message_key = "unexpected_http_response"
     return FailureDetails(
         category=category,
-        stage=stage,
+        stage=context.stage,
         retry=retry,
         message_key=message_key,
-        http_status=summary.status,
         retry_at=summary.retry_at,
         attempt_id=attempt_id,
         operation_id=operation_id,
-        response_content_type=summary.content_type,
-        response_schema=summary.schema,
-        server_request_id=summary.request_id,
-        diagnostics=summary.as_diagnostics(),
+        http=summary.as_safe_metadata(),
     )
 
 

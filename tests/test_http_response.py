@@ -4,7 +4,19 @@ import datetime
 from unittest.mock import Mock
 
 from opower.exceptions import FailureCategory, FailureStage, RetryDisposition
-from opower.http_response import classify_http_failure, summarize_response
+from opower.http_response import (
+    AuthenticationExpectation,
+    RequestContext,
+    RequestPurpose,
+    classify_http_failure,
+    summarize_response,
+)
+
+_AUTHENTICATED_COST_REQUEST = RequestContext(
+    purpose=RequestPurpose.DATA_BROWSER,
+    stage=FailureStage.COST_READS,
+    authentication=AuthenticationExpectation.REAUTHENTICATE_ON_401,
+)
 
 
 def test_response_summary_excludes_payload_values() -> None:
@@ -34,21 +46,42 @@ def test_rate_limit_is_retryable_at_provider_time() -> None:
     response.content_type = "application/json"
     response.headers = {"Retry-After": "Wed, 22 Jul 2026 20:01:00 GMT"}
 
-    details = classify_http_failure(summarize_response(response), FailureStage.LOGIN, operation_id="operation-123")
+    details = classify_http_failure(
+        summarize_response(response),
+        RequestContext(
+            purpose=RequestPurpose.LOGIN,
+            stage=FailureStage.LOGIN,
+            authentication=AuthenticationExpectation.NO_AUTOMATIC_REAUTHENTICATION,
+        ),
+        operation_id="operation-123",
+    )
 
     assert details.category is FailureCategory.RATE_LIMITED
     assert details.retry is RetryDisposition.RETRY_AFTER
     assert details.operation_id == "operation-123"
 
 
-def test_unauthorized_response_does_not_prove_bad_credentials() -> None:
-    """A generic 401/403 requires one reauthentication, not a credential reset."""
+def test_401_on_authenticated_api_request_allows_one_reauthentication() -> None:
+    """A bearer-protected API 401 is evidence that its session needs replacement."""
     response = Mock()
-    response.status = 403
+    response.status = 401
     response.content_type = "text/html"
     response.headers = {}
 
-    details = classify_http_failure(summarize_response(response), FailureStage.COST_READS)
+    details = classify_http_failure(summarize_response(response), _AUTHENTICATED_COST_REQUEST)
 
     assert details.category is FailureCategory.SESSION_EXPIRED
     assert details.retry is RetryDisposition.REAUTHENTICATE_ONCE
+
+
+def test_generic_403_is_authorization_failure_without_reauthentication() -> None:
+    """A generic 403 never starts a replacement login."""
+    response = Mock()
+    response.status = 403
+    response.content_type = "application/json"
+    response.headers = {}
+
+    details = classify_http_failure(summarize_response(response), _AUTHENTICATED_COST_REQUEST)
+
+    assert details.category is FailureCategory.AUTHORIZATION
+    assert details.retry is RetryDisposition.DO_NOT_RETRY

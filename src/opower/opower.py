@@ -15,8 +15,24 @@ import arrow
 from aiohttp.client_exceptions import ClientError, ClientResponseError
 
 from .const import USER_AGENT
-from .exceptions import ApiException, CannotConnect, FailureStage, TemporaryAuthenticationError
-from .http_response import ResponseSummary, classify_http_failure, new_correlation_id, summarize_response
+from .exceptions import (
+    ApiException,
+    CannotConnect,
+    FailureCategory,
+    FailureDetails,
+    FailureStage,
+    RetryDisposition,
+    TemporaryAuthenticationError,
+)
+from .http_response import (
+    AuthenticationExpectation,
+    RequestContext,
+    RequestPurpose,
+    ResponseSummary,
+    classify_http_failure,
+    new_correlation_id,
+    summarize_response,
+)
 from .utilities import UtilityBase
 
 _LOGGER = logging.getLogger(__file__)
@@ -246,7 +262,6 @@ class Opower:
         self.customers: list[Any] = []
         self.user_accounts: list[Any] = []
         self.meters: list[str] = []
-        self._operation_id: str | None = None
 
     async def async_login(self) -> None:
         """Login to the utility website and authorize opower.com for access.
@@ -255,14 +270,18 @@ class Opower:
         :raises MfaChallenge: if interactive MFA is required
         :raises CannotConnect: if we receive any HTTP error
         """
-        self._operation_id = new_correlation_id()
+        attempt_id = new_correlation_id()
         try:
             self.access_token = await self.utility.async_login(self.session, self.username, self.password, self.login_data)
         except ClientResponseError as err:
             details = classify_http_failure(
                 ResponseSummary(err.status or 0, None, None, None, None),
-                FailureStage.LOGIN,
-                operation_id=self._operation_id,
+                RequestContext(
+                    purpose=RequestPurpose.LOGIN,
+                    stage=FailureStage.LOGIN,
+                    authentication=AuthenticationExpectation.NO_AUTOMATIC_REAUTHENTICATION,
+                ),
+                attempt_id=attempt_id,
             )
             raise TemporaryAuthenticationError("Utility login request failed", details=details) from err
         except ClientError as err:
@@ -809,6 +828,7 @@ class Opower:
         headers: dict[str, str],
         stage: FailureStage = FailureStage.UNKNOWN,
     ) -> Any:
+        operation_id = new_correlation_id()
         full_url = f"{url}?{urlencode(params)}"
         _LOGGER.debug("Fetching: %s", full_url)
         try:
@@ -819,8 +839,16 @@ class Opower:
                         f"HTTP Error: {resp.status}",
                         url=full_url,
                         status=resp.status,
-                        response_text=_safe_response_text(summary),
-                        details=classify_http_failure(summary, stage, operation_id=self._operation_id),
+                        response_summary=summary.as_safe_metadata(),
+                        details=classify_http_failure(
+                            summary,
+                            RequestContext(
+                                purpose=RequestPurpose.GENERIC_API,
+                                stage=stage,
+                                authentication=AuthenticationExpectation.REAUTHENTICATE_ON_401,
+                            ),
+                            operation_id=operation_id,
+                        ),
                     )
                 result = await resp.json()
                 _LOGGER.log(
@@ -832,6 +860,7 @@ class Opower:
 
     async def _async_post_graphql(self, query: str, headers: dict[str, str]) -> Any:
         """Execute a GraphQL query against the Opower API."""
+        operation_id = new_correlation_id()
         url = f"https://{self._get_subdomain()}.opower.com/{self._get_api_root()}/edge/apis/dsm-graphql-v1/cws/graphql"
         _LOGGER.debug("GraphQL query to: %s", url)
         try:
@@ -846,8 +875,16 @@ class Opower:
                         f"HTTP Error: {resp.status}",
                         url=url,
                         status=resp.status,
-                        response_text=_safe_response_text(summary),
-                        details=classify_http_failure(summary, FailureStage.GRAPHQL, operation_id=self._operation_id),
+                        response_summary=summary.as_safe_metadata(),
+                        details=classify_http_failure(
+                            summary,
+                            RequestContext(
+                                purpose=RequestPurpose.FORECAST_GRAPHQL,
+                                stage=FailureStage.GRAPHQL,
+                                authentication=AuthenticationExpectation.REAUTHENTICATE_ON_401,
+                            ),
+                            operation_id=operation_id,
+                        ),
                     )
                 result = await resp.json()
                 _LOGGER.log(
@@ -856,15 +893,20 @@ class Opower:
                     summarize_response(resp, result).as_diagnostics(),
                 )
                 if "errors" in result:
+                    summary = summarize_response(resp, result)
                     raise ApiException(
-                        f"GraphQL Error: {result['errors']}",
+                        "GraphQL response contained errors",
                         url=url,
+                        response_summary=summary.as_safe_metadata(),
+                        details=FailureDetails(
+                            category=FailureCategory.PROTOCOL,
+                            stage=FailureStage.GRAPHQL,
+                            retry=RetryDisposition.DO_NOT_RETRY,
+                            message_key="graphql_errors",
+                            operation_id=operation_id,
+                            http=summary.as_safe_metadata(),
+                        ),
                     )
                 return result
         except ClientError as e:
             raise ApiException(f"Client Error: {e}", url=url) from e
-
-
-def _safe_response_text(summary: ResponseSummary) -> str:
-    """Render response metadata without exposing provider response content."""
-    return f"content_type={summary.content_type or 'unknown'}; schema={summary.schema or ()}"

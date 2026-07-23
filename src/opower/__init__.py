@@ -22,6 +22,7 @@ from .exceptions import (
     TemporaryAuthenticationError,
 )
 from .helpers import create_cookie_jar
+from .http_response import AuthenticationExpectation, RequestContext, RequestPurpose
 from .opower import (
     Account,
     AggregateType,
@@ -44,6 +45,7 @@ __all__ = [
     "ApiException",
     "AuthenticationAttemptSuperseded",
     "AuthenticationError",
+    "AuthenticationExpectation",
     "AuthenticationTimeout",
     "CannotConnect",
     "CostRead",
@@ -63,6 +65,8 @@ __all__ = [
     "ProtocolError",
     "RateLimited",
     "ReadResolution",
+    "RequestContext",
+    "RequestPurpose",
     "RetryDisposition",
     "SafeHttpMetadata",
     "TemporaryAuthenticationError",
